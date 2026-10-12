@@ -1,0 +1,856 @@
+import asyncio
+import hashlib
+import json
+import os
+import time
+from math import sqrt
+from random import randint
+
+import flet as ft
+
+VERDE = "green"
+VERMELHO = "red"
+
+
+# =====================================================================
+#  UTILIZADORES (users.json)
+# =====================================================================
+def _hash(texto: str) -> str:
+    return hashlib.sha256(texto.encode()).hexdigest()
+
+
+def _ficheiro_users() -> str:
+    # No APK o Flet fornece FLET_APP_STORAGE_DATA (pasta persistente da app).
+    # No Windows usa AppData\Local\DilEPASKS, como na versão original.
+    pasta = os.getenv("FLET_APP_STORAGE_DATA")
+    if not pasta:
+        base = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+        pasta = os.path.join(base, "DilEPASKS")
+    os.makedirs(pasta, exist_ok=True)
+    caminho = os.path.join(pasta, "users.json")
+    if not os.path.exists(caminho):
+        with open(caminho, "w", encoding="utf-8") as f:
+            json.dump({"admin": {"password": _hash("1234")}}, f, indent=4)
+    return caminho
+
+
+def carregar_users() -> dict:
+    with open(_ficheiro_users(), "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def guardar_users(users: dict) -> None:
+    with open(_ficheiro_users(), "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=4)
+
+
+# =====================================================================
+#  FUNÇÕES DE CÁLCULO (cada uma devolve: texto, cor)
+# =====================================================================
+def calc_primaria(kg, volume):
+    g_l = (kg / volume) * 1000
+    if g_l <= 0:
+        return f"Valor inválido: {g_l:.4f} g/L", VERMELHO
+    if g_l >= 17:
+        return f"Cuidado! Excesso pode prejudicar o sistema.\nConcentração: {g_l:.4f} g/L", VERMELHO
+    return (f"Concentração calculada: {g_l:.4f} g/L\n"
+            f"Verifique se a concentração corresponde ao caudal e à turvação da água bruta."), VERDE
+
+
+def calc_secundaria(total_kg, vol_total, vazio):
+    kg = (vazio / vol_total) * total_kg
+    if kg <= 0:
+        return f"Valor inválido: {kg:.4f} kg", VERMELHO
+    if kg >= 30:
+        return f"Cuidado! Excesso pode prejudicar o sistema.\nProduto para a preparação: {kg:.4f} kg", VERMELHO
+    return (f"Produto para a preparação: {kg:.4f} kg\n"
+            f"Verifique se a concentração corresponde ao caudal e à turvação da água bruta."), VERDE
+
+
+def calc_debito(caudal, otima_mg_l, producao_g_l):
+    debito = (caudal * (otima_mg_l / 1000)) / producao_g_l
+    if debito <= 0:
+        return f"Valor inválido: {debito:.4f} L/h", VERMELHO
+    if debito >= 700:
+        return f"Cuidado! Excesso pode prejudicar o sistema.\n Caudal: {debito:.4f} L/h", VERMELHO
+    return (f"Débito da bomba doseadora: {debito:.4f} L/h\ne {debito * producao_g_l:.4f} g/h.\n"
+            f"Verifique se a concentração corresponde ao caudal e à turvação da água bruta."), VERDE
+
+
+def calc_turvacao(bruta, destilada, leitura):
+    if bruta <= 0 or leitura <= 0 or destilada <= 0:
+        return "Valor inválido", VERMELHO
+    ntu = ((bruta + destilada) / bruta) * leitura
+    if ntu >= 20000:
+        return f"Cuidado! dupla ou tripla diluição, pouca exatidão.\nResultado: {ntu:.4f} NTU", VERMELHO
+    return (f"Concentração calculada: {ntu:.4f} NTU\n"
+            f"Verificar o estado das cuvetes e o interior da célula..."), VERDE
+
+
+def calc_afericao(tempo):
+    if tempo <= 0:
+        return f"Valor inválido: {tempo:.4f} s", VERMELHO
+    caudal = 3600 / tempo
+    if caudal <= 200:
+        return f"Cuidado! Pode ser insuficiente pra a ETA convencional.\nCaudal: {caudal:.4f} L/h", VERMELHO
+    if caudal >= 600:
+        return f"Cuidado! Pode ser excesso de pra a ETA convencional/compacta.\nCaudal: {caudal:.4f} L/h", VERMELHO
+    return (f"Caudal: {caudal:.4f} L/h\n"
+            f"Verificar a válvula de retenção ou o estado da bomba doseadora"), VERDE
+
+
+def calc_cuba_cilindrica(altura_cm, raio_cm):
+    litros = (raio_cm ** 2 * 3.1416 * altura_cm) / 1000
+    if litros <= 0:
+        return f"Valor inválido: {litros:.4f} L", VERMELHO
+    if litros >= 1000:
+        return (f"Cuidado! Tanques novos (cimento de portland) e sem impermeabilizante,\n"
+                f"pode consumir o Cloro Residual Livre ou deixar cheiro na água.\n"
+                f"Volume: {litros:.4f} L\nVerificar a altura da água dentro do tanque"), VERDE
+    return f"Volume: {litros:.4f} L\nVerificar a altura da água dentro do tanque", VERDE
+
+
+def calc_cuba_retangular(altura, largura, comprimento):
+    litros = (altura * largura * comprimento) * 1000
+    if litros <= 0:
+        return f"Valor inválido: {litros:.4f} L", VERMELHO
+    return (f"Cuidado! Tanques novos (cimento de portland) e sem impermeabilizante,\n"
+            f"pode consumir o Cloro Residual Livre ou deixar cheiro na água.\n"
+            f"Volume: {litros:.4f} L\nVerificar a altura da água dentro do tanque"), VERDE
+
+
+def calc_molaridade(massa_molecular, massa_pesada, volume_ml):
+    mol_l = (massa_pesada / massa_molecular) / (volume_ml / 1000)
+    if mol_l <= 0:
+        return f"Valor inválido: {mol_l:.4f} Mol/L", VERMELHO
+    return (f"Cuidado! Executa com vidraria limpa, seca, fria a temperatura ambiente \n"
+            f"e esterelizada com ácido nítrico ou ácido sulfúrico.\n"
+            f"Concentração: {mol_l:.4f} Mol/L\nEconomiza reagente!"), VERDE
+
+
+def calc_erro(referencia, medido):
+    absoluto = abs(medido - referencia)
+    relativo = (absoluto / referencia) * 100
+    return f" Erro absoluto: {absoluto:.4f}. Erro relativo: {relativo:.4f} %", VERDE
+
+
+def calc_c1v1(c1, v1, v2):
+    if c1 <= 0:
+        return f"Valor invalido {c1:.4f} mg/L | g/L | %", VERMELHO
+    if v1 <= 0:
+        return f"Valor invalido {v1:.4f} mL | L", VERMELHO
+    if v2 <= 0:
+        return f"Valor invalido {v2:.4f} mL | L", VERMELHO
+    return f"Concentração: {(c1 * v1) / v2:.4f} mg/L | g/L | %", VERDE
+
+
+def calc_acrescimo(c1, v1, c2):
+    if c1 <= 0:
+        return f"Valor invalido {c1:.4f} mg/L | g/L | %", VERMELHO
+    if v1 <= 0:
+        return f"Valor invalido {v1:.4f} mL | L", VERMELHO
+    if c2 <= 0:
+        return f"Valor invalido {c2:.4f} mg/L | g/L | %", VERMELHO
+    acrescimo = (c1 * v1) / c2 - v1
+    return f"Resultado: volume de água destilada à acrescentar: {acrescimo:.4f} mL", VERDE
+
+
+def calc_acido(densidade, percentagem, volume_ml):
+    mg = ((volume_ml * densidade) * (percentagem / 100)) * 1000
+    if mg <= 0:
+        return f"Valor inválido. {mg:.4f} mg/L | L", VERMELHO
+    if volume_ml == 100:
+        return f"Volume de 100 mL inserido. Concentração {mg / 100:.4f} mg/ 1 mL", VERDE
+    if volume_ml == 10:
+        return f"Volume de 10 mL inserido. Concentração {mg / 10:.4f} mg/ 1 mL", VERDE
+    return f"Volume inserido diferente de 100 ou 10 mL: {mg:.4f} mg/volume que se adicionou", VERMELHO
+
+
+def calc_padronizacao(v_primaria, v_secundaria, c_secundaria):
+    if v_primaria == 0 or v_secundaria == 0 or c_secundaria == 0:
+        return "Valor inválido (não pode ser zero)", VERMELHO
+    r = (c_secundaria * v_secundaria) / v_primaria
+    return f"Resultado: {r:.6f} mg | g | Mol | N", VERDE
+
+
+def calc_normalidade(molaridade, n):
+    if molaridade <= 0 or n <= 0:
+        return f"Valor invalido {molaridade * n:.4f} N ", VERMELHO
+    return f"Resultado: {molaridade * n:.4f} N", VERDE
+
+
+def calc_sst(papel1, papel2, volume_ml):
+    # Fórmula mantida exactamente como na versão original
+    fator1 = volume_ml / 1000
+    fator = (papel2 - papel1) * 1000
+    sst = (fator / fator1) * 1000
+    ssv = sst * 0.7
+    if volume_ml <= 4:
+        return "Valor do volume, abaixo de 5 mL.", VERMELHO
+    if volume_ml >= 11:
+        return "Valor do volume, acima de 10 mL.", VERMELHO
+    return (f"Valor do volume inserido entre 5 e 10 mL. \nMelhor devido o entupimento do filtro.\n"
+            f"SST {sst:.4f} mg/L e SSV {ssv:.4f} mg/L"), VERDE
+
+
+def _texto_abs(conc):
+    if conc >= 50:
+        return (f"Verifica o critério de aceitação, muitos parâmetros estão abaixo de 50 mg/L. \n"
+                f"Concentração: {conc:.4f} mg/L "), VERMELHO
+    return (f" Ao determinar, verifica a higienização das vidrarias, a validade de cada solução/reagente \n"
+            f"e a temperatura da vidraria. Concentração: {conc:.4f} mg/L "), VERDE
+
+
+def calc_abs_pos_pos(absorvancia, m, c):
+    return _texto_abs((absorvancia - c) / m)
+
+
+def calc_abs_pos_neg(absorvancia, m, c):
+    return _texto_abs((absorvancia + c) / m)
+
+
+def calc_abs_neg_pos(absorvancia, m, c):
+    return _texto_abs((absorvancia - c) / (m * -1))
+
+
+def calc_taxa_superficial(comprimento, largura, caudal):
+    taxa = caudal / (comprimento * largura)
+    if taxa <= 0:
+        return f"Valor inválido {taxa} m3/m2", VERMELHO
+    if taxa > 9:
+        return f"Cuidado!Taxa de Escoamento Superficial: {taxa:.4f} m3/m2 \nPara ETA´s convencionais 9 m3/m2.", VERMELHO
+    if taxa > 4:
+        return f"Cuidado!Taxa de Escoamento Superficial: {taxa:.4f} m3/m2 \nPara ETA´s convencionais 4 m3/m2.", VERMELHO
+    return f" Taxa de Escoamento Superficial: {taxa:.4f} m3/m2.", VERDE
+
+
+def calc_taxa_retencao(caudal, volume_orgao):
+    retencao = (volume_orgao / caudal) * 60
+    renovacao = caudal / volume_orgao
+    if retencao <= 0:
+        return f"Valor inválido {retencao} h", VERMELHO
+    if retencao <= 20:
+        return f"Cuidado! Taxa de retenção: {retencao:.4f} fora da referência mínima de 20 min", VERMELHO
+    if retencao >= 30:
+        return f"Cuidado! Taxa de retenção: {retencao:.4f} fora da referência máxima de 30 min", VERMELHO
+    return (f" Taxa de retenção: {retencao:.4f} min. Taxa de renovação: {renovacao:.4f}h. "
+            f"\nCuidado para que a renovação da água não esteja inferior a 1h ou acima de 4h "), VERDE
+
+
+def calc_tensao(agua_destilada, agua_bruta):
+    t = (agua_destilada / agua_bruta) * 72
+    if t <= 0:
+        return f"Valor inválido {t} mN/m", VERMELHO
+    if t > 72:
+        return (f"Cuidado! Tensão Superficial: {t:.4f} referência = 72 mN/m. "
+                f"\nMede a temperatura no intervalo 20º a 25º"), VERMELHO
+    return f" Tensão superficial: {t:.4f} mN/m.", VERDE
+
+
+def calc_gradiente(potencia, viscosidade, volume, fator):
+    interior = (potencia * fator) / (viscosidade * volume)
+    if interior <= 0:
+        return f"Valor inválido. {interior:.4f} s-1", VERMELHO
+    g = sqrt(interior)
+    if g >= 60:
+        return f"Cuidado! Desfragmentação dos flocos. Gradiente: {g:.4f} s-1  \nacima da referência máxima 60 s-1", VERMELHO
+    if g <= 20:
+        return f"Cuidado! Flocos fracos. Gradiente: {g:.4f} s-1 \nabaixo da referencia mínima 20 s-1", VERMELHO
+    return f" Gradiente: {g:.4f} s-1 ", VERDE
+
+
+def calc_carga_organica(caudal, dbo5_mg_l):
+    carga = caudal * (dbo5_mg_l / 1000)
+    pct = (carga / 45) * 100
+    if carga <= 0:
+        return f"Valor inválido. {carga:.4f} kgDBO/dia.", VERMELHO
+    if carga > 980:
+        return (f"Cuidado! Muito alimento caso for projectada para 985 kgDBO/dia. \n"
+                f"Alimento: {carga:.4f} kgDBO/dia. Percentagem {pct:.4f} %"), VERMELHO
+    return f" Alimento: {carga:.4f} kgDBO/dia. Percentagem: {pct:.4f} % ", VERDE
+
+
+def calc_razao_fm(volume_reator, mlssv_mg_l, dbo_kg_dia):
+    fm = dbo_kg_dia / (volume_reator * (mlssv_mg_l / 1000))
+    if fm <= 0:
+        return f"Valor inválido. Concentração: {fm:.4f} kgDBO/kgSSV.d.", VERMELHO
+    if fm < 0.1:
+        return (f"Cuidado! Lodo velho, marron,\nnitrifica demais e forma espuma. "
+                f"Concentração: {fm:.4f} kgDBO/kgSSV.d."), VERMELHO
+    if fm > 0.6:
+        return (f"Cuidado! Lodo muito jovem,\nfilamentoso, não decanta. "
+                f"Concentração: {fm:.4f} kgDBO/kgSSV.d."), VERMELHO
+    return f" Floco marron claro, \nsaudável. Concentração: {fm:.4f} kgDBO/kgSSV.d. ", VERDE
+
+
+def calc_extracao(volume_reator, mlssv, sst_eel, idade_lodo):
+    qw = (volume_reator * (mlssv / 1000)) / (idade_lodo * (sst_eel / 1000))
+    r1 = mlssv / 1000
+    r2 = sst_eel / 1000
+    r4 = r1 / (r2 - r1)
+    if qw <= 0:
+        return (f"Valor inválido. Volume à extrair: {qw:.4f} m3/dia. "
+                f"Taxa de recirculação:{r4:.4f} - {r4 * 100:.4f} % do Q afluente."), VERMELHO
+    return (f" Volume à extrair: {qw:.4f} m3/dia. "
+            f"Taxa de recirculação: {r4:.4f} - {r4 * 100:.4f} % do Q afluente."), VERDE
+
+
+def calc_idade_lodo(caudal_purga, mlssv, ssv_eel, volume_reator):
+    trc = ((mlssv / 1000) * volume_reator) / ((ssv_eel / 1000) * caudal_purga)
+    if trc <= 0:
+        return f"Valor inválido. Concentração: {trc:.4f} dias.", VERMELHO
+    if trc < 5:
+        return f"Cuidado! idade do lodo: {trc:.4f} dias. Dias mínimo 5.", VERMELHO
+    if trc > 10:
+        return f"Cuidado! Idade do lodo: {trc:.4f} dias. Dias máximo 10.", VERMELHO
+    return f" Idade do lodo: {trc:.4f} dias", VERDE
+
+
+def calc_ivl(v30, sst):
+    ivl = (v30 / sst) * 1000
+    if ivl <= 0:
+        return f"Valor inválido. IVL: {ivl:.4f} ml/g.", VERMELHO
+    if ivl < 70:
+        return f"Cuidado! Decantação deficitária. \nIVL: {ivl:.4f} mL/g. Mínimo 70 mL/g.", VERMELHO
+    if ivl > 150:
+        return f"Cuidado! Bulking, decantação deficitária. \nIVL: {ivl:.4f} mL/g. Máximo 150 mL/g.", VERMELHO
+    return f" IVL: {ivl:.4f} mL/g", VERDE
+
+
+def calc_mlssv_ssv(sst_reator, sst_eel):
+    return (f"MLSSV - MBBR {sst_reator * 0.7:.4f} mg/L. \n"
+            f"SSV - EEL: {sst_eel * 0.7:.4f} mg/L."), VERDE
+
+
+# =====================================================================
+#  COMPONENTES REUTILIZÁVEIS
+# =====================================================================
+def num(campo: ft.TextField) -> float:
+    """Lê o campo como número (aceita vírgula ou ponto)."""
+    return float(campo.value.replace(",", ".").strip())
+
+
+def titulo(texto: str) -> ft.Text:
+    return ft.Text(texto, size=16, weight=ft.FontWeight.BOLD)
+
+
+def bloco(titulo_texto, campos, botao, calcular, extra=None):
+    """
+    Cria um bloco: título + campos numéricos + botão + resultado.
+    campos  -> lista com os rótulos dos campos
+    calcular -> função(valores...) que devolve (texto, cor)
+    """
+    entradas = [
+        ft.TextField(label=rotulo, keyboard_type=ft.KeyboardType.NUMBER)
+        for rotulo in campos
+    ]
+    resultado = ft.Text("Resultado aparecerá aqui")
+
+    def ao_clicar(e):
+        try:
+            valores = [num(c) for c in entradas]
+            texto, cor = calcular(*valores)
+        except ValueError:
+            texto, cor = "Por favor insere apenas números válidos.", VERMELHO
+        except ZeroDivisionError:
+            texto, cor = "Valor inválido: divisão por zero.", VERMELHO
+        except Exception as ex:
+            texto, cor = f"Ocorreu um problema: {ex}", VERMELHO
+        resultado.value = texto
+        resultado.color = cor
+        resultado.update()
+
+    return ft.Column(
+        [titulo(titulo_texto), *(extra or []), *entradas, ft.Button(botao, on_click=ao_clicar), resultado],
+        spacing=8,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
+
+
+def juntar(*blocos):
+    itens = []
+    for b in blocos:
+        itens += [b, ft.Divider()]
+    return ft.Column(itens[:-1], spacing=12, horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+
+
+def conversor(titulo_texto, fatores, de, para):
+    valor = ft.TextField(label="Digita o valor", keyboard_type=ft.KeyboardType.NUMBER)
+    origem = ft.Dropdown(label="De", value=de, expand=True,
+                         options=[ft.DropdownOption(key=k) for k in fatores])
+    destino = ft.Dropdown(label="Para", value=para, expand=True,
+                          options=[ft.DropdownOption(key=k) for k in fatores])
+    resultado = ft.Text("Resultado aparecerá aqui")
+
+    def converter(e):
+        try:
+            v = num(valor)
+            base = v * fatores[origem.value]
+            r = base / fatores[destino.value]
+            resultado.value = f"{v} {origem.value} = {r:.4f} {destino.value}"
+        except ValueError:
+            resultado.value = "Digite um número válido."
+        resultado.update()
+
+    return ft.Column(
+        [titulo(titulo_texto), valor, ft.Row([origem, destino]),
+         ft.Button("Converter🔄", on_click=converter), resultado],
+        spacing=8, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
+
+
+def imagem(nome, largura, altura):
+    # Coloca as imagens na pasta "assets" (ias2.png, QIPI5.png, QIPI22.png)
+    return ft.Image(src=nome, width=largura, height=altura, error_content=ft.Container())
+
+
+# =====================================================================
+#  SECÇÕES
+# =====================================================================
+def sec_inicio():
+    return ft.Column(
+        [
+            ft.Row([imagem("QIPI22.png", 260, 260)], alignment=ft.MainAxisAlignment.CENTER),
+            ft.Text("Olá! \nSou o Dil; \n💡guia  para ações práticas. \nVenha comigo!➡️",
+                    size=24, weight=ft.FontWeight.BOLD),
+            ft.Text("Oi! \nNão te esqueças de manter o laboratório \nhigienizado. \n"
+                    "Regista toda actividade exigida \n e não te esqueças de dar uma olhada no plano "
+                    "das actividades do dia \ne nos procedimentos de cada tarefa. \n"
+                    "Não me decepciona e seja responsável!", weight=ft.FontWeight.BOLD),
+            ft.Row([imagem("ias2.png", 120, 120), imagem("QIPI5.png", 120, 150)],
+                   alignment=ft.MainAxisAlignment.CENTER),
+            ft.Text("By Gerónimo Manuel-2026||01 \nEngº.Mateus Inglês - Conselheiro Técnico | Diretor Técnico \n"
+                    "📧: info@epaks.co.ao \n📱: +244941648993", size=12),
+            ft.Text("Seja bem vindo! Bom trabalho 😃"),
+        ],
+        spacing=12,
+    )
+
+
+def sec_cubas():
+    return juntar(
+        bloco("PREPARAÇÃO PRIMÁRIA (cuba vazia total) 🧪",
+              ["Valor do produto pesado (kg)", "Valor do volume da Cuba (L)"],
+              "Calcular Concentração", calc_primaria),
+        bloco("PREPARAÇÃO SECUNDÁRIA (cuba com a porção restante e o vazio) 🧪",
+              ["Valor do produto pesado total (kg)", "Volume total da Cuba (L)", "Valor do vazio da Cuba (L)"],
+              "Calcular Massa", calc_secundaria),
+        bloco("OTIMIZAÇÃO DO SISTEMA 🧪",
+              ["Valor do caudal de Tratamento (L)", "Concentração ótima (mg/L)", "Concentração produção (g/L)"],
+              "Calcular Débito", calc_debito),
+    )
+
+
+def sec_agua_bruta():
+    return juntar(
+        bloco("DILUIÇÃO ÁGUA BRUTA 🏞️",
+              ["Volume da água bruta 🏞️ (mL)", "Volume da água destilada 💧 (mL)", "Leitura do aparelho 📟"],
+              "Calcular Turvação", calc_turvacao),
+        bloco("AFERIÇÃO DO CAUDAL-BOMBA ⛽",
+              ["Valor do tempo ⏱️ (s)"],
+              "Calcular Caudal", calc_afericao),
+    )
+
+
+def sec_volume_cubas():
+    return juntar(
+        bloco("CÁLCULO CUBA CILÍNDRICA 🛢️",
+              ["Valor da altura ↕️ (cm)", "Valor do raio ⭕ (cm)"],
+              "Calcular Volume", calc_cuba_cilindrica),
+        bloco("CÁLCULO CUBA RETANGULAR 📦",
+              ["Valor da altura ↕️ (m)", "Valor da largura ↔️ (m)", "Valor do comprimento ↔️ (m)"],
+              "Calcular Volume", calc_cuba_retangular),
+    )
+
+
+def sec_molaridade():
+    return juntar(
+        bloco("MOLARIDADE ⚗️",
+              ["Massa molecular relativa (g/mol) ⚛️", "Massa pesada (g) ⚖️", "Volume da água (mL) 💧"],
+              "Calcular Concentração", calc_molaridade),
+        bloco("ERRO RELATIVO E ERRO ABSOLUTO 🎯❌ | 📊📉",
+              ["Valor de referência 📏", "Valor medido 🎯"],
+              "Calcular Erros", calc_erro),
+    )
+
+
+def sec_concentracoes():
+    return juntar(
+        bloco("CÁLCULO GERAL DAS CONCENTRAÇÕES ➗",
+              ["Concentração 1 (mg/L | g/L | %) 🧪", "Volume 1 (mL | L) 🥛", "Volume 2 (mL | L) 💧"],
+              "Calcular Concentração", calc_c1v1),
+        bloco("CÁLCULO DO VOLUME PARA O ACRÉSCIMO ➗",
+              ["Concentração 1 (mg/L | g/L | %) 🧪", "Volume 1 (mL | L) 🥛", "Concentração 2 (mg/L | g/L | %) 🧪"],
+              "Calcular Volume", calc_acrescimo),
+    )
+
+
+def sec_padronizacao():
+    exemplos = ft.Text(
+        "Substância HCl - Reação - 1 H+ - n - 1 \n"
+        "Substância H2SO4 - Reação - 2 H+ - n - 2 \n"
+        "Substância H3PO4 - Reação - 3 H+ - n - 3 \n"
+        "Substância NaOH - Reação - 1 OH- - n - 1 \n"
+        "Substância Ca(OH)2 - Reação - 2 OH- - n - 2", size=13)
+    return juntar(
+        bloco("PADRONIZAÇÃO 🎯",
+              ["Volume da concentração primária (mL) 🥛", "Volume da concentração secundária (mL) 🧪",
+               "Concentração secundária (mg | g | Mol | N) 🧪"],
+              "Calcular Concentração", calc_padronizacao),
+        bloco("CONVERSÃO PARA NORMALIDADE [eq/L] 🎯",
+              ["Molaridade (Mol/L) 🥛", "n - número de H+ ou OH- trocados (fator de equivalência) ⚛️"],
+              "Calcular Normalidade", calc_normalidade, extra=[exemplos]),
+    )
+
+
+def sec_acidos():
+    return bloco("CONCENTRAÇÃO ÁCIDO, BASE 🧴",
+                 ["Densidade (g/mL | g/cm3) 🧪", "Percentagem (%)", "Volume (mL) 🥛"],
+                 "Calcular Concentração", calc_acido)
+
+
+def sec_conversores():
+    litros = {"kl": 1000, "hl": 100, "dal": 10, "l": 1, "dl": 0.1, "cl": 0.01, "ml": 0.001,
+              "m3": 1000, "dm3": 1, "cm3": 0.001, "mm3": 0.000001}
+    gramas = {"kg": 1000, "hg": 100, "dag": 10, "g": 1, "dg": 0.1, "cg": 0.01, "mg": 0.001}
+    metros = {"km": 1000, "hm": 100, "dam": 10, "m": 1, "dm": 0.1, "cm": 0.01, "mm": 0.001}
+    return juntar(
+        conversor("UNIDADE DE CAPACIDADE 🍶", litros, "l", "ml"),
+        conversor("UNIDADE DE MASSA ⚖️", gramas, "g", "mg"),
+        conversor("UNIDADE DE COMPRIMENTO 📐", metros, "m", "mm"),
+    )
+
+
+def sec_espectrometria():
+    campos = ["Valor da absorvância 💡➡️", "Valor de m ou a 🔢", "Valor de c ou b 🔢"]
+    return juntar(
+        bloco("X = Y - C / M - quando m na função for positivo e o sinal posicional for positivo",
+              campos, "Calcular Concentração", calc_abs_pos_pos),
+        bloco("X = Y + C / M - quando m na função for positivo e o sinal posicional for negativo",
+              campos, "Calcular Concentração", calc_abs_pos_neg),
+        bloco("X = Y - C / - M - quando m na função for negativo e o sinal posicional for positivo (NÃO RECOMENDÁVEL)",
+              campos, "Calcular Concentração", calc_abs_neg_pos),
+    )
+
+
+def sec_sst():
+    return bloco("CÁLCULO SST ⚖️",
+                 ["Papel pesado ou peso 1 (g) ⚪", "Papel pesado ou peso 2 (g) ⚪",
+                  "Volume da água bruta no cadinho de porcelana ou óxido de alumínio (mL) 🏞️"],
+                 "Calcular Concentração", calc_sst)
+
+
+def sec_taxas():
+    return juntar(
+        bloco("TAXA DE ESCOAMENTO SUPERFICIAL 🌊",
+              ["Comprimento (m) ↔️", "Largura (m) ↔️", "Caudal de tratamento (m3) 🌊⚙️"],
+              "Calcular Taxa Superficial", calc_taxa_superficial),
+        bloco("TAXA DE RETENÇÃO HIDRÁULICA 🕒🔄",
+              ["Caudal (m3) 🌊⚙️", "Volume do órgão na ETA/ETAR em questão (m3) 🧊"],
+              "Calcular Taxa de Retenção", calc_taxa_retencao),
+        bloco("TENSÃO SUPERFICIAL DA ÁGUA 🧼✨",
+              ["Água destilada (mL) 💧", "Água bruta (mL) 🏞️"],
+              "Calcular Tensão Superficial", calc_tensao),
+        bloco("GRADIENTE DE AGITAÇÃO 🔄",
+              ["Potência do motor electro-agitador (watt) ⚡🌀",
+               "Viscosidade da água, depende da temperatura (N.s/m2) 💧",
+               "Volume do floculador (m3) 🧊", "Factor (0,4 a 0,95)"],
+              "Calcular Gradiente", calc_gradiente),
+    )
+
+
+def sec_ergo():
+    palpite = ft.TextField(label="Digita o valor meu amigo 😃", keyboard_type=ft.KeyboardType.NUMBER)
+    resultado = ft.Text("Resultado aparecerá aqui", size=17)
+
+    async def jogar(e):
+        try:
+            jogador = int(palpite.value)
+        except (ValueError, TypeError):
+            resultado.value = "Por favor insere apenas valores válidos"
+            resultado.color = VERMELHO
+            resultado.update()
+            return
+        computador = randint(0, 5)
+        resultado.value = "Pensando..."
+        resultado.color = "blue"
+        resultado.update()
+        await asyncio.sleep(1)
+        if jogador == computador:
+            resultado.value = f"Parabéns! Você acertou o número {computador}!"
+            resultado.color = VERDE
+        else:
+            resultado.value = f"Ganhei! Eu pensei no número {computador}"
+            resultado.color = VERMELHO
+        resultado.update()
+
+    return ft.Column(
+        [
+            ft.Text("REPOUSO ERGONOMÉTRICO", size=17, weight=ft.FontWeight.BOLD),
+            ft.Text("Olá! Sou o Dil. Vou escolher um número entre 0 e 5, tente adivinhar! 😃",
+                    weight=ft.FontWeight.BOLD),
+            palpite,
+            resultado,
+            ft.Button("Mostra - me", bgcolor=VERMELHO, color="white", on_click=jogar),
+        ],
+        spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+    )
+
+
+def sec_etar():
+    return juntar(
+        bloco("CARGA ORGÂNICA APLICADA",
+              ["Caudal de entrada acumulado (m3/dia)", "Valor de DBO5 (mg/L)"],
+              "Calcular Carga Orgânica", calc_carga_organica),
+        bloco("RAZÃO F/M - Alimento/Microorganismo",
+              ["Volume do reator de arejamento (m3) 🧊", "MLSSV no reator de arejamento (mg/L)",
+               "DBO obtido na carga orgânica aplicada (kgDBO/dia)"],
+              "Calcular Razão F/M", calc_razao_fm),
+        bloco("EXTRAÇÃO DE LAMAS ⚖️",
+              ["Volume do reator de arejamento (m3) 🧊", "MLSSV no reator de arejamento (mg/L)",
+               "SST EEL (mg/L)", "Idade do lodo (5 à 15 dias)"],
+              "Calcular Volume à Extrair", calc_extracao),
+        bloco("IDADE DO LODO",
+              ["Caudal da purga (m3/dia) 🌊⚙️", "MLSSV no reator de arejamento (mg/L)",
+               "SSV EEL - coletar amostra na EEL (mg/L)", "Volume do reator de arejamento (m3) 🧊"],
+              "Calcular Idade do Lodo", calc_idade_lodo),
+        bloco("IVL",
+              ["Valor do V30 (mL) 🥛", "SST no reator de arejamento (mg/L)"],
+              "Calcular IVL", calc_ivl),
+        bloco("MLSSV reator e SSV EEL ⚖️",
+              ["SST no reator de arejamento (mg/L)", "SST EEL (mg/L)"],
+              "Calcular MLSSV e SSV - EEL", calc_mlssv_ssv),
+    )
+
+
+def sec_notas():
+    return ft.Text(
+        "Gerónimo Manuel - criador do projecto, sob controlo do Exm.Diretor Técnico; Engº Mateus Inglês. \n"
+        "Projectou - se para facilitar a operacionalização das ETA´s e ETAR´s no Cuanza - Sul de forma simples e rápida. \n"
+        "Apovado por EPASKS aos 24 de Agosto de 2026 \n"
+        "NIF - 5601022917. info@epasks.co.ao versão 1.0 "
+    )
+
+
+SECCOES = [
+    ("🏠 Início", sec_inicio),
+    ("🧪 Cubas", sec_cubas),
+    ("💧 Água bruta", sec_agua_bruta),
+    ("📏 Volume cubas", sec_volume_cubas),
+    ("⚗️ Molaridade", sec_molaridade),
+    ("➗ Concentrações", sec_concentracoes),
+    ("🎯 Padronização", sec_padronizacao),
+    ("🧴 Ácidos/bases", sec_acidos),
+    ("🔄 Conversores", sec_conversores),
+    ("🌈 Espectrometria", sec_espectrometria),
+    ("⚖️ SST", sec_sst),
+    ("🌊 Taxas", sec_taxas),
+    ("Ergo", sec_ergo),
+    ("ETAR", sec_etar),
+    ("Nota do Autor", sec_notas),
+]
+
+
+# =====================================================================
+#  APP
+# =====================================================================
+def main(page: ft.Page):
+    page.title = "Controlo Analítico"
+    page.window.icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "Logo.ico")
+    page.window.width = 420
+    page.window.height = 800
+    page.theme_mode = ft.ThemeMode.SYSTEM
+    page.padding = 12
+
+    cronometro = {"rodando": False, "total": 0}
+
+    # ---------------------------- LOGIN ----------------------------
+    def mostrar_login():
+        page.clean()
+        ativo = {"on": True}
+
+        hora = ft.Text("", size=16, weight=ft.FontWeight.BOLD)
+        campo_user = ft.TextField(label="Digita o nome de usuário", text_align=ft.TextAlign.CENTER)
+        campo_pass = ft.TextField(label="Digita a senha de usuário", password=True,
+                                  can_reveal_password=True, text_align=ft.TextAlign.CENTER)
+        msg = ft.Text("", color=VERMELHO)
+
+        async def relogio():
+            while ativo["on"]:
+                hora.value = f"Hora: {time.strftime('%H:%M:%S')}"
+                try:
+                    hora.update()
+                except Exception:
+                    break
+                await asyncio.sleep(1)
+
+        def entrar(e):
+            u = campo_user.value.strip()
+            p = campo_pass.value.strip()
+            if not u or not p:
+                msg.value = "Preencha usuário e senha"
+                msg.update()
+                return
+            users = carregar_users()
+            if u in users and users[u]["password"] == _hash(p):
+                ativo["on"] = False
+                mostrar_app()
+            else:
+                msg.value = "Credenciais inválidas"
+                msg.update()
+
+        def ir_mudar_senha(e):
+            ativo["on"] = False
+            mostrar_mudar_senha()
+
+        campo_pass.on_submit = entrar
+
+        page.add(
+            ft.Column(
+                [
+                    ft.Text("Tela de login", size=22, weight=ft.FontWeight.BOLD),
+                    hora, campo_user, campo_pass, msg,
+                    ft.Row([ft.Button("Entrar", on_click=entrar),
+                            ft.Button("Mudar senha", on_click=ir_mudar_senha)],
+                           alignment=ft.MainAxisAlignment.CENTER),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=12, expand=True,
+            )
+        )
+        page.run_task(relogio)
+
+    def mostrar_mudar_senha():
+        page.clean()
+        campo_user = ft.TextField(label="Usuário")
+        campo_atual = ft.TextField(label="Senha atual", password=True, can_reveal_password=True)
+        campo_nova = ft.TextField(label="Nova senha", password=True, can_reveal_password=True)
+        campo_conf = ft.TextField(label="Confirmar nova senha", password=True, can_reveal_password=True)
+        msg = ft.Text("", color=VERMELHO)
+
+        def mostrar_msg(texto, cor=VERMELHO):
+            msg.value = texto
+            msg.color = cor
+            msg.update()
+
+        async def tentar_mudar(e):
+            u = campo_user.value.strip()
+            atual = campo_atual.value.strip()
+            nova = campo_nova.value.strip()
+            conf = campo_conf.value.strip()
+            if not u or not atual or not nova:
+                return mostrar_msg("Preencha todos os campos")
+            if nova != conf:
+                return mostrar_msg("Nova senha e confirmação não coincidem")
+            users = carregar_users()
+            if u not in users:
+                return mostrar_msg("Usuário não encontrado")
+            if users[u]["password"] != _hash(atual):
+                return mostrar_msg("Senha atual incorreta")
+            users[u]["password"] = _hash(nova)
+            guardar_users(users)
+            mostrar_msg("Senha alterada com sucesso", VERDE)
+            await asyncio.sleep(1)
+            mostrar_login()
+
+        page.add(
+            ft.Column(
+                [
+                    ft.Text("Mudar Senha", size=20, weight=ft.FontWeight.BOLD),
+                    campo_user, campo_atual, campo_nova, campo_conf, msg,
+                    ft.Row([ft.Button("Confirmar alteração", on_click=tentar_mudar),
+                            ft.Button("Fechar", on_click=lambda e: mostrar_login())],
+                           alignment=ft.MainAxisAlignment.CENTER),
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=12, expand=True,
+            )
+        )
+
+    # ------------------------- APP PRINCIPAL -------------------------
+    def mostrar_app():
+        page.clean()
+
+        # ----- cronómetro (sempre visível) -----
+        tempo = ft.Text("00:00:00", size=22, weight=ft.FontWeight.BOLD)
+
+        def formatar(total):
+            return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+
+        async def loop_cronometro():
+            while cronometro["rodando"]:
+                await asyncio.sleep(1)
+                if not cronometro["rodando"]:
+                    break
+                cronometro["total"] += 1
+                tempo.value = formatar(cronometro["total"])
+                try:
+                    tempo.update()
+                except Exception:
+                    cronometro["rodando"] = False
+                    break
+
+        def iniciar(e):
+            if not cronometro["rodando"]:
+                cronometro["rodando"] = True
+                cronometro["total"] = 0
+                page.run_task(loop_cronometro)
+
+        def parar(e):
+            cronometro["rodando"] = False
+
+        def restaurar(e):
+            cronometro["total"] = 0
+            tempo.value = "00:00:00"
+            tempo.update()
+
+        barra_cronometro = ft.Row(
+            [
+                ft.Text("⏱️ CRONÓMETRO"),
+                tempo,
+                ft.IconButton(icon=ft.Icons.PLAY_ARROW, icon_color=VERDE, tooltip="Iniciar", on_click=iniciar),
+                ft.IconButton(icon=ft.Icons.STOP, icon_color=VERMELHO, tooltip="Parar", on_click=parar),
+                ft.IconButton(icon=ft.Icons.REPLAY, tooltip="Restaurar", on_click=restaurar),
+            ],
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+        )
+
+        # ----- navegação entre secções -----
+        corpo = ft.Column(scroll=ft.ScrollMode.AUTO, expand=True,
+                          horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
+        cache = {}
+
+        def mostrar(i):
+            if i not in cache:
+                cache[i] = ft.Column(
+                    [ft.Text(SECCOES[i][0], size=20, weight=ft.FontWeight.BOLD), SECCOES[i][1]()],
+                    spacing=12, horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                )
+            corpo.controls = [cache[i]]
+            corpo.update()
+
+        navegacao = ft.Row(
+            [ft.TextButton(nome, on_click=lambda e, i=i: mostrar(i)) for i, (nome, _) in enumerate(SECCOES)],
+            scroll=ft.ScrollMode.AUTO,
+        )
+
+        page.add(
+            ft.Column(
+                [
+                    ft.Text("DilEPASKS", size=20, weight=ft.FontWeight.BOLD),
+                    barra_cronometro,
+                    navegacao,
+                    ft.Divider(),
+                    corpo,
+                ],
+                expand=True,
+            )
+        )
+        mostrar(0)
+
+    mostrar_login()
+
+
+ft.run(main, assets_dir="assets")
